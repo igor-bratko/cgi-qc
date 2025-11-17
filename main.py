@@ -4,22 +4,25 @@ import os
 import re
 import itertools
 from typing import List, Dict
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 import boto3
 import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
-from PIL import Image
 import imagehash
 import cv2
+from PIL import Image, ImageOps
+import mediapipe as mp
+
+SEG = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
 
 # ---------- Config from env ----------
-S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://localhost:9002")
-S3_REGION = os.getenv("S3_REGION", "us-east-1")
-S3_BUCKET = os.getenv("S3_BUCKET", "cgi")
-S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "miniotest")
-S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "miniotest")
-S3_PATH_STYLE = os.getenv("S3_PATH_STYLE", "true").lower() == "true"
+# S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://localhost:9002")
+S3_REGION = os.getenv("S3_REGION", "eu-central-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "test-web-qwe")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "...")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "...")
+# S3_PATH_STYLE = os.getenv("S3_PATH_STYLE", "true").lower() == "true"
 PORT = int(os.getenv("PORT", "8085"))
 REMBG_ENABLED = os.getenv("REMBG_ENABLED", "false").lower() == "true"
 
@@ -40,20 +43,19 @@ BG_CLEAN_MIN = 0.65
 # ---------- S3 client ----------
 S3 = boto3.client(
     "s3",
-    endpoint_url=S3_ENDPOINT,
+    # endpoint_url=S3_ENDPOINT,
     aws_access_key_id=S3_ACCESS_KEY,
     aws_secret_access_key=S3_SECRET_KEY,
     region_name=S3_REGION,
     config=boto3.session.Config(signature_version="s3v4",
-                                s3={"addressing_style": "path" if S3_PATH_STYLE else "virtual"})
+                                s3={"addressing_style": "virtual"})
 )
 
 
 # ---------- Models ----------
-class ValidateReq(BaseModel):
+class AssetDto(BaseModel):
     assetId: str
     s3Keys: List[str]
-    sourceType: str
 
 
 # ---------- Helpers ----------
@@ -105,7 +107,7 @@ def score_bg_clean(img: Image.Image) -> float:
     trans_ratio = float((border_alpha < 8).mean())  # 0..1
 
     # RGB border pixels
-    border_rgb_u8 = arr[..., :3][mask]                    # uint8 0..255
+    border_rgb_u8 = arr[..., :3][mask]  # uint8 0..255
     if border_rgb_u8.size == 0:
         return max(trans_ratio, 0.0)
 
@@ -121,7 +123,7 @@ def score_bg_clean(img: Image.Image) -> float:
 
     # soft uniformity score on normalized RGB
     border_rgb = border_rgb_u8.astype(np.float32) / 255.0
-    col_std = float(border_rgb.std(axis=0).mean())    # 0..~0.5
+    col_std = float(border_rgb.std(axis=0).mean())  # 0..~0.5
     UNIFORM_REF_STD = 0.06
     uniform = float(1.0 / (1.0 + (col_std / UNIFORM_REF_STD)))
 
@@ -191,6 +193,7 @@ def angle_diversity_stats(images: List[Image.Image], keys: List[str]) -> Dict:
 # ---------- API ----------
 app = FastAPI(title="Image Intake Validator", version="0.1.0")
 
+
 @app.post("/debug/echo")
 async def debug_echo(request: Request):
     raw = await request.body()
@@ -200,9 +203,9 @@ async def debug_echo(request: Request):
 
 
 @app.post("/validate")
-def validate(req: ValidateReq):
+def validate(req: AssetDto):
     print("Start validation")
-    bucket = "cgi"
+    bucket = "test-web-qwe"
     keys = req.s3Keys
 
     reasons: List[str] = []
@@ -274,6 +277,66 @@ def validate(req: ValidateReq):
         "metrics": metrics,
         "selected": selected
     }
+
+
+def _read_s3_png(bucket: str, key: str) -> Image.Image:
+    obj = S3.get_object(Bucket=bucket, Key=key)
+    img = Image.open(io.BytesIO(obj["Body"].read()))
+    return ImageOps.exif_transpose(img)
+
+
+def _derive_mask_key(orig_key: str) -> str:
+    # as requested: replace /validated/ with /masks/
+    return orig_key.replace("/validated/", "/masks/")
+
+
+def _derive_out_key(orig_key: str) -> str:
+    # write cleaned PNG next to validated. change folder to /cleaned/ and extension to .png
+    base, _ext = os.path.splitext(orig_key)
+    cleaned_base = base.replace("/validated/", "/cleaned/")
+    return f"{cleaned_base}.png"
+
+
+@app.post("/apply-masks-batch")
+def apply_masks_batch(req: AssetDto):
+    cleaned = []
+    for key in req.s3Keys:
+        mask_key = _derive_mask_key(key)
+        out_key = _derive_out_key(key)
+        try:
+            # 1) load original
+            orig = _read_s3_png(S3_BUCKET, key).convert("RGBA")
+            w, h = orig.size
+
+            # 2) load mask
+            m = _read_s3_png(S3_BUCKET, mask_key).convert("L")
+            if m.size != (w, h):
+                m = m.resize((w, h), Image.BILINEAR)
+
+            # 3) normalize to alpha
+            arr = np.asarray(m, dtype=np.uint8)
+            alpha = arr if arr.mean() < 128 else (255 - arr)
+            alpha = (alpha > 32).astype(np.uint8) * 255
+            alpha_img = Image.fromarray(alpha, mode="L")
+
+            # 4) compose transparent PNG
+            r, g, b, _ = orig.split()
+            cleaned_img = Image.merge("RGBA", (r, g, b, alpha_img))
+
+            # 5) upload
+            buf = io.BytesIO()
+            cleaned_img.save(buf, format="PNG", optimize=True)
+            buf.seek(0)
+            print("Upload to: " + out_key)
+            S3.put_object(Bucket=S3_BUCKET, Key=out_key, Body=buf.getvalue(), ContentType="image/png")
+
+            cleaned.append(out_key)
+
+        except Exception as e:
+            raise HTTPException(status_code=400,
+                                detail=f"apply-mask failed for key='{key}' mask='{mask_key}': {e}")
+
+    return {"assetId": req.assetId, "processed": len(cleaned), "cleaned": cleaned}
 
 
 # Optional local dev entrypoint
